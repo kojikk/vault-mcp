@@ -2,7 +2,7 @@
 
 # --- build stage ---------------------------------------------------------------
 # Base image pinned by digest (lesson H-4): node:22-bookworm-slim.
-FROM node@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS build
+FROM node@sha256:e3ffe0cbaeebdcddbfe1ee7bca9b564a92863a8386d5b99a3d72677b3667b61d AS build
 WORKDIR /app
 
 # Install with the lockfile and DO NOT run lifecycle scripts (lesson C-1: no postinstall,
@@ -19,7 +19,7 @@ RUN npx tsc -p tsconfig.json
 RUN npm prune --omit=dev --ignore-scripts
 
 # --- runtime stage -------------------------------------------------------------
-FROM node@sha256:7af03b14a13c8cdd38e45058fd957bf00a72bbe17feac43b1c15a689c029c732 AS runtime
+FROM node@sha256:e3ffe0cbaeebdcddbfe1ee7bca9b564a92863a8386d5b99a3d72677b3667b61d AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
