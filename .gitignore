@@ -1,0 +1,21 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+secrets/*
+!secrets/mcp_token.example
+*.tsbuildinfo
+coverage/
+.vault-test/
+
+# Private planning / audit docs — design context, not part of the shipped system.
+second-brain-plan.md
+second-brain-tech-and-devplan.md
+SECURITY_AUDIT.md
+
+# Local, machine-specific deployment helpers (contain absolute host paths).
+.env
+add-vault-mcp.ps1
+apply-vault-mcp.bat

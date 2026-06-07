@@ -1,0 +1,80 @@
+# Vault MCP deployment (Desktop, behind Caddy).
+#
+# Security posture (checklist §8):
+#  - MCP port is NEVER published to the host; it is reachable only by Caddy over an
+#    `internal: true` network that has NO route to the internet → no egress (triad leg 1).
+#  - The container runs non-root, read-only rootfs, all caps dropped, no-new-privileges,
+#    and the ONLY writable mount is the vault bind-mount (lesson H-4).
+#  - The Docker socket is NOT mounted anywhere (lesson H-4).
+#  - The token is delivered as a Docker secret, not an env literal (lesson C-3).
+
+services:
+  vault-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      # Only the internal, egress-less network. No `edge` membership → cannot reach WAN.
+      - vault_internal
+    environment:
+      VAULT_ROOT: /vault
+      MCP_TOKEN_FILE: /run/secrets/mcp_token
+      BIND_HOST: 0.0.0.0
+      PORT: "8787"
+      LOG_FILE: /var/log/vault-mcp/app.log
+      LOG_LEVEL: info
+      GIT_AUTHOR_NAME: vault-mcp
+      GIT_AUTHOR_EMAIL: vault-mcp@localhost
+    secrets:
+      - mcp_token
+    volumes:
+      # The single writable mount: the canonical vault on the Windows host FS.
+      - type: bind
+        source: ${VAULT_HOST_PATH:?set VAULT_HOST_PATH to the vault folder on the host}
+        target: /vault
+      # Writable log dir (rootfs is read-only); a named volume keeps it off the rootfs.
+      - vault_mcp_logs:/var/log/vault-mcp
+    # tmpfs for any transient scratch the runtime needs while rootfs is read-only.
+    tmpfs:
+      - /tmp
+
+  caddy:
+    image: caddy@sha256:77c07d5ebfa5be9fd6c820d2094ae662c9e7eeb9bf98346b7f639900263ee2a2
+    restart: unless-stopped
+    depends_on:
+      - vault-mcp
+    networks:
+      - vault_internal
+      - edge
+    ports:
+      # HTTP now (HTTPS-ready). Bind to the host so LAN bot + localhost surfaces reach it.
+      - "8788:80"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+      - caddy_data:/data
+      - caddy_config:/config
+
+networks:
+  edge:
+    driver: bridge
+  vault_internal:
+    driver: bridge
+    internal: true # no gateway to the host/WAN → MCP container has no egress
+
+secrets:
+  mcp_token:
+    file: ./secrets/mcp_token
+
+volumes:
+  vault_mcp_logs:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.github
+test
+*.md
+!agent.md
+.env
+.env.*
+secrets
+coverage
+.vault-test
+Dockerfile
+docker-compose.yml
+Caddyfile

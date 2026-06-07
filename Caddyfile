@@ -1,0 +1,47 @@
+# Caddy — the single ingress to Vault MCP. HTTP now, HTTPS-ready.
+#
+# To enable TLS later (deferred): replace `:80` with your hostname and add a `tls`
+# directive (Caddy auto-provisions via ACME, e.g. DNS-01). No app changes required.
+
+{
+	admin off
+	# Keep server tokens off; don't advertise version.
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:80 {
+	# Liveness passthrough (unauthenticated; returns no vault data).
+	handle /healthz {
+		reverse_proxy vault-mcp:8787
+	}
+
+	# The MCP endpoint. Auth (Bearer) is enforced by the app, before body parsing.
+	handle /mcp {
+		reverse_proxy vault-mcp:8787 {
+			# Bound upstream timeouts to match the app's slow-loris protection.
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+	}
+
+	# Everything else is denied at the edge.
+	handle {
+		respond "not found" 404
+	}
+
+	# Modest request body cap at the edge as defense in depth (app also limits).
+	request_body {
+		max_size 2MB
+	}
+
+	log {
+		output stderr
+		format json
+		# Never log Authorization headers.
+		level INFO
+	}
+}
