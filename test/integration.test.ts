@@ -124,6 +124,52 @@ describe("promote transaction", () => {
   });
 });
 
+describe("add_raw (append-only sources)", () => {
+  it("writes a timestamped .md into _raw/ with frontmatter", async () => {
+    const res = await text("add_raw", { content: "сырой текст статьи", category: "articles", title: "Моя статья", source: "https://x" });
+    const m = res.match(/_raw\/articles\/[^\s]+\.md/);
+    expect(m).not.toBeNull();
+    const body = readFileSync(path.join(vaultRoot, m![0]), "utf8");
+    expect(body).toContain("ingested: false");
+    expect(body).toContain("https://x");
+    expect(body).toContain("сырой текст статьи");
+  });
+
+  it("is idempotent on replay", async () => {
+    await text("add_raw", { content: "x", idempotency_key: "raw1" });
+    const replay = await text("add_raw", { content: "x", idempotency_key: "raw1" });
+    expect(replay).toContain("idempotent replay");
+  });
+});
+
+describe("search scope", () => {
+  it("knowledge scope excludes _raw", async () => {
+    await text("add_raw", { content: "уникмаркер_рав", category: "notes" });
+    await text("create_note", { path: "Знания/k.md", content: "уникмаркер_рав в знании" });
+    const all = await text("search", { query: "уникмаркер_рав" });
+    expect(all).toContain("_raw/");
+    const knowledge = await text("search", { query: "уникмаркер_рав", scope: "knowledge" });
+    expect(knowledge).toContain("Знания/k.md");
+    expect(knowledge).not.toContain("_raw/");
+  });
+});
+
+describe("lint", () => {
+  it("reports orphans, broken links, stale entities, unlinked raw", async () => {
+    await text("create_note", { path: "orphan.md", content: "никто на меня не ссылается" });
+    await text("create_note", { path: "src.md", content: "ссылка на [[nonexistent-xyz]]" });
+    await text("create_note", { path: "Знания/old.md", content: "старьё", frontmatter: { type: "entity", updated: "2000-01-01" } });
+    await text("add_raw", { content: "несвязанное сырьё", category: "notes" });
+
+    const res = await text("lint", {});
+    const report = JSON.parse(res.slice(res.indexOf("{")));
+    expect(report.orphans).toContain("orphan.md");
+    expect(report.brokenLinks.some((b: { target: string }) => b.target === "nonexistent-xyz")).toBe(true);
+    expect(report.staleEntities.some((s: { file: string }) => s.file === "Знания/old.md")).toBe(true);
+    expect(report.unlinkedRaw.length).toBeGreaterThan(0);
+  });
+});
+
 describe("journal + commit", () => {
   it("writes _log.md and commits each mutation", async () => {
     await text("create_note", { path: "x.md", content: "hi" });

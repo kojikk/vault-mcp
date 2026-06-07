@@ -23,6 +23,15 @@ export interface SearchHit {
 
 export type SearchKind = "content" | "tag";
 
+/**
+ * Which zone of the vault to search:
+ *  - "all": everything (default; preserves prior behaviour)
+ *  - "knowledge": exclude raw sources and attachments — use this to answer questions / dedup
+ *    against compiled knowledge only (agent.md §9 Query)
+ *  - "raw": only the _raw/ inbox of unprocessed sources (agent.md §7 Ingest)
+ */
+export type SearchScope = "all" | "knowledge" | "raw";
+
 const MAX_PREVIEW = 200;
 
 function escapeRegex(s: string): string {
@@ -31,10 +40,11 @@ function escapeRegex(s: string): string {
 
 export function search(
   paths: VaultPaths,
-  opts: { query: string; kind?: SearchKind; limit?: number },
+  opts: { query: string; kind?: SearchKind; limit?: number; scope?: SearchScope },
 ): Promise<SearchHit[]> {
   const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
   const kind = opts.kind ?? "content";
+  const scope = opts.scope ?? "all";
 
   // Build the pattern. `tag` searches for an Obsidian #tag token.
   let pattern: string;
@@ -61,6 +71,13 @@ export function search(
     "-g",
     "!.tmp-*",
   ];
+  // Zone scoping. An inclusive glob makes ripgrep search only matching files; exclusive
+  // globs drop the raw inbox / attachments from compiled-knowledge searches.
+  if (scope === "knowledge") {
+    args.push("-g", "!_raw", "-g", "!_attachments");
+  } else if (scope === "raw") {
+    args.push("-g", "_raw/**");
+  }
   if (fixedStrings) args.push("--fixed-strings");
   args.push("-e", pattern, "--", paths.root);
 

@@ -117,6 +117,58 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext, ledger: 
     },
   );
 
+  server.registerTool(
+    "add_raw",
+    {
+      title: "Add a raw source to _raw/ (append-only)",
+      description:
+        "Save a TEXT source (pasted article, thought stream, document excerpt) into the append-only _raw/ inbox for later ingest. Writes a new timestamped .md with frontmatter; never edits existing raw. Binaries (PDF/images) are NOT added here — drop those into _attachments/ via the filesystem.",
+      inputSchema: {
+        content: z.string().min(1).describe("The raw source text to archive verbatim."),
+        category: z
+          .enum(["articles", "notes", "docs"])
+          .optional()
+          .describe("Subfolder under _raw/. Default 'notes'."),
+        title: z.string().optional().describe("Human title; used for the filename slug and frontmatter."),
+        source: z.string().optional().describe("Where it came from (URL or short description) — stored in frontmatter."),
+        idempotency_key: idemKey,
+      },
+      annotations: additive,
+    },
+    async (args) => {
+      try {
+        return await applyIdempotent(args.idempotency_key, async () => {
+          const category = args.category ?? "notes";
+          const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+          const slug = slugify(args.title ?? "");
+          const filename = slug ? `${stamp}-${slug}.md` : `${stamp}.md`;
+          const rel = path.posix.join("_raw", category, filename);
+          const fm: Record<string, unknown> = {
+            ...(args.title ? { title: args.title } : {}),
+            ...(args.source ? { source: args.source } : {}),
+            date: new Date().toISOString().slice(0, 10),
+            ingested: false,
+          };
+          const body = matter.stringify(args.content.replace(/\s+$/, "") + "\n", fm);
+          await core.mutate({
+            op: "add_raw",
+            message: `add_raw: ${rel}`,
+            journal: { path: rel, category },
+            body: async (tx) => {
+              if (tx.exists(rel)) {
+                throw new CoreError("ALREADY_EXISTS", "a raw file already exists at that path; raw is append-only");
+              }
+              tx.writeFile(rel, body);
+            },
+          });
+          return `added raw source ${rel} (ingested: false)`;
+        });
+      } catch (err) {
+        return mapError(err, log, "add_raw");
+      }
+    },
+  );
+
   // update_memory / update_index / update_hot share a "rewrite a root/node file" shape.
   const rewriteTool = (
     name: "update_memory" | "update_index" | "update_hot",
@@ -177,4 +229,14 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext, ledger: 
     () => "_hot.md",
     {},
   );
+}
+
+/** Build a filesystem-safe slug from a title (keeps unicode letters/digits, caps length). */
+function slugify(title: string): string {
+  return title
+    .trim()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/g, "");
 }
