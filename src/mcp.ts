@@ -3,10 +3,11 @@ import type { ToolContext } from "./tools/context.js";
 import { IdempotencyLedger } from "./tools/idempotency.js";
 import { registerReadTools } from "./tools/read.js";
 import { registerWriteTools } from "./tools/write.js";
+import { registerEditTools } from "./tools/edit.js";
 import { registerStructuralTools } from "./tools/structural.js";
 
 /**
- * Build a fresh MCP server with the full tool surface (least privilege: read, additive,
+ * Build a fresh MCP server with the full tool surface (least privilege: read, additive, edit,
  * structural, soft-delete — no hard delete, no shell, no network). The transport creates one
  * of these per request (stateless), but the ledger is shared so idempotency survives across
  * requests within a process lifetime.
@@ -20,6 +21,7 @@ export function makeServerFactory(ctx: ToolContext): () => McpServer {
     );
     registerReadTools(server, ctx);
     registerWriteTools(server, ctx, ledger);
+    registerEditTools(server, ctx, ledger);
     registerStructuralTools(server, ctx);
     return server;
   };
