@@ -170,6 +170,109 @@ describe("lint", () => {
   });
 });
 
+describe("edit_note (anchored, two-step)", () => {
+  it("dry-run shows a diff and changes nothing; confirm applies", async () => {
+    await text("create_note", { path: "e.md", content: "цена была 100 рублей" });
+    const plan = await text("edit_note", { path: "e.md", old_string: "100", new_string: "200" });
+    expect(plan).toContain("DRY-RUN");
+    expect(readFileSync(path.join(vaultRoot, "e.md"), "utf8")).toContain("100"); // unchanged
+
+    const applied = await text("edit_note", { path: "e.md", old_string: "100", new_string: "200", confirm: true });
+    expect(applied).toContain("edited e.md");
+    expect(readFileSync(path.join(vaultRoot, "e.md"), "utf8")).toContain("200 рублей");
+  });
+
+  it("refuses an ambiguous match unless expected_occurrences is set", async () => {
+    await text("create_note", { path: "amb.md", content: "x x x" });
+    const ambiguous = await text("edit_note", { path: "amb.md", old_string: "x", new_string: "y", confirm: true });
+    expect(ambiguous).toContain("INVALID_NAME");
+    expect(readFileSync(path.join(vaultRoot, "amb.md"), "utf8")).toContain("x x x"); // unchanged
+
+    const ok = await text("edit_note", { path: "amb.md", old_string: "x", new_string: "y", expected_occurrences: 3, confirm: true });
+    expect(ok).toContain("3 occurrence");
+    expect(readFileSync(path.join(vaultRoot, "amb.md"), "utf8")).toContain("y y y");
+  });
+
+  it("refuses a missing old_string and refuses to edit _log.md", async () => {
+    await text("create_note", { path: "m.md", content: "hello" });
+    const missing = await text("edit_note", { path: "m.md", old_string: "NOPE", new_string: "x", confirm: true });
+    expect(missing).toContain("NOT_FOUND");
+
+    const logEdit = await text("edit_note", { path: "_log.md", old_string: "create_note", new_string: "x", confirm: true });
+    expect(logEdit).toContain("RESERVED_PATH");
+  });
+
+  it("can refresh a cache file like _index.md", async () => {
+    await text("update_index", { content: "# index\n- nodeA: старое\n" });
+    await text("edit_note", { path: "_index.md", old_string: "старое", new_string: "новое", confirm: true });
+    expect(readFileSync(path.join(vaultRoot, "_index.md"), "utf8")).toContain("новое");
+  });
+
+  it("is idempotent on replay", async () => {
+    await text("create_note", { path: "idem.md", content: "AAA" });
+    await text("edit_note", { path: "idem.md", old_string: "AAA", new_string: "BBB", confirm: true, idempotency_key: "ed1" });
+    const replay = await text("edit_note", { path: "idem.md", old_string: "AAA", new_string: "BBB", confirm: true, idempotency_key: "ed1" });
+    expect(replay).toContain("idempotent replay");
+  });
+});
+
+describe("ingest primitives", () => {
+  it("mark_raw_ingested flips only the flag and leaves the body", async () => {
+    const res = await text("add_raw", { content: "тело сырья остаётся", category: "notes", title: "T" });
+    const rawRel = res.match(/_raw\/notes\/[^\s]+\.md/)![0];
+    expect(readFileSync(path.join(vaultRoot, rawRel), "utf8")).toContain("ingested: false");
+
+    const marked = await text("mark_raw_ingested", { path: rawRel });
+    expect(marked).toContain("ingested: true");
+    const body = readFileSync(path.join(vaultRoot, rawRel), "utf8");
+    expect(body).toContain("ingested: true");
+    expect(body).toContain("тело сырья остаётся");
+  });
+
+  it("mark_raw_ingested rejects paths outside _raw/", async () => {
+    await text("create_note", { path: "notraw.md", content: "x" });
+    const rejected = await text("mark_raw_ingested", { path: "notraw.md" });
+    expect(rejected).toContain("INVALID_NAME");
+  });
+
+  it("append_contradiction creates the table and lint counts it open", async () => {
+    await text("append_contradiction", {
+      concept: "RAG",
+      claim_a: "устарел",
+      source_a: "статья X",
+      claim_b: "нужен для больших баз",
+      source_b: "статья Y",
+    });
+    const contra = readFileSync(path.join(vaultRoot, "_contradictions.md"), "utf8");
+    expect(contra).toContain("| RAG |");
+    expect(contra).toContain("| open |");
+
+    const lint = await text("lint", {});
+    const report = JSON.parse(lint.slice(lint.indexOf("{")));
+    expect(report.openContradictions).toBeGreaterThan(0);
+  });
+});
+
+describe("ingest_planner (read-only worksheet)", () => {
+  it("recommends UPDATE for known concepts and CREATE for new ones, and writes nothing", async () => {
+    await text("create_note", { path: "Знания/LangGraph.md", content: "LangGraph это фреймворк", frontmatter: { type: "entity" } });
+    const raw = await text("add_raw", { content: "про LangGraph и про NeverHeardOf", category: "articles" });
+    const rawRel = raw.match(/_raw\/articles\/[^\s]+\.md/)![0];
+
+    const res = await text("ingest_planner", { concepts: ["LangGraph", "NeverHeardOf"], raw_path: rawRel });
+    const data = JSON.parse(res.slice(res.indexOf("{")));
+    const lg = data.worksheet.find((w: { concept: string }) => w.concept === "LangGraph");
+    const nh = data.worksheet.find((w: { concept: string }) => w.concept === "NeverHeardOf");
+    expect(lg.recommendation).toBe("UPDATE");
+    expect(lg.topCandidate).toContain("Знания/LangGraph.md");
+    expect(nh.recommendation).toBe("CREATE");
+    expect(data.raw.exists).toBe(true);
+    expect(data.raw.ingested).toBe(false);
+    // raw was not marked ingested by the planner (read-only)
+    expect(readFileSync(path.join(vaultRoot, rawRel), "utf8")).toContain("ingested: false");
+  });
+});
+
 describe("journal + commit", () => {
   it("writes _log.md and commits each mutation", async () => {
     await text("create_note", { path: "x.md", content: "hi" });

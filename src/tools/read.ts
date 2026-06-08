@@ -1,4 +1,5 @@
 import { z } from "zod";
+import matter from "gray-matter";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import path from "node:path";
 import type { ToolContext } from "./context.js";
@@ -161,6 +162,87 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
       }
     },
   );
+
+  server.registerTool(
+    "ingest_planner",
+    {
+      title: "Plan an ingest (read-only worksheet)",
+      description:
+        "Semi-assembled ingest helper (agent.md §Ingest). You extract the concept terms from a source (that is brain work); this batches the mechanical dedup for them in one call. For each concept it searches the compiled knowledge zone and recommends UPDATE <existing page> or CREATE (no match). If raw_path is given, reports that source's ingest status. Writes NOTHING. Returns structural metadata (paths/counts) — drive the actual writes with create_note / edit_note / mark_raw_ingested.",
+      inputSchema: {
+        concepts: z
+          .array(z.string().min(1))
+          .min(1)
+          .describe("Concept/entity terms you extracted from the source."),
+        raw_path: z.string().optional().describe("Optional _raw/ file being ingested, to report its status."),
+        limit: z.number().int().min(1).max(20).optional().describe("Max candidate pages per concept (default 5)."),
+      },
+      annotations: readOnly,
+    },
+    async (args) => {
+      try {
+        const limit = args.limit ?? 5;
+        const worksheet: {
+          concept: string;
+          recommendation: "UPDATE" | "CREATE";
+          topCandidate: string | null;
+          candidates: string[];
+        }[] = [];
+        for (const concept of args.concepts) {
+          const hits = await search(core.paths, { query: concept, kind: "content", scope: "knowledge", limit: limit * 4 });
+          const candidates = [...new Set(hits.map((h) => h.path))].filter(isKnowledgePage).slice(0, limit);
+          worksheet.push({
+            concept,
+            recommendation: candidates.length ? "UPDATE" : "CREATE",
+            topCandidate: candidates[0] ?? null,
+            candidates,
+          });
+        }
+
+        let raw: Record<string, unknown> | null = null;
+        if (args.raw_path) {
+          if (core.pathExists(args.raw_path)) {
+            let ingested: unknown = null;
+            try {
+              ingested = (matter(core.readTextFile(args.raw_path)).data as Record<string, unknown>).ingested ?? null;
+            } catch {
+              ingested = null;
+            }
+            raw = { path: args.raw_path, exists: true, ingested };
+          } else {
+            raw = { path: args.raw_path, exists: false };
+          }
+        }
+
+        const checklist = [
+          "1. Сохранить сырьё в _raw/ через add_raw (если ещё не сохранено).",
+          "2. Для каждого concept: UPDATE → edit_note существующей страницы; CREATE → create_note (frontmatter type:entity).",
+          "3. Конфликт с записанным знанием → append_contradiction.",
+          "4. Обновить backlinks/ссылки между затронутыми страницами.",
+          "5. Обновить кэш: edit_note/update_memory узла, update_index, update_hot.",
+          "6. mark_raw_ingested для raw_path, когда источник разобран.",
+        ];
+
+        return textResult(
+          `INGEST WORKSHEET (read-only; paths are vault metadata). Drive writes yourself.\n` +
+            JSON.stringify({ raw, worksheet, checklist }, null, 2),
+        );
+      } catch (err) {
+        return mapError(err, log, "ingest_planner");
+      }
+    },
+  );
+
+  // ingest_planner dedup should surface real content/entity pages, not service or structural
+  // files (the journal, manifests, node scaffolding) which the knowledge scope still includes.
+  const SERVICE_FILES = new Set(["_log.md", "_index.md", "_hot.md", "_contradictions.md"]);
+  const STRUCTURAL_BASENAMES = new Set(["_home.md", "_memory.md"]);
+  function isKnowledgePage(rel: string): boolean {
+    const p = rel.replace(/\\/g, "/");
+    if (SERVICE_FILES.has(p)) return false;
+    if (STRUCTURAL_BASENAMES.has(path.posix.basename(p))) return false;
+    return true;
+  }
 
   server.registerTool(
     "lint",

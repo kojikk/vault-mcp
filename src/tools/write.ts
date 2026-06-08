@@ -229,6 +229,100 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext, ledger: 
     () => "_hot.md",
     {},
   );
+
+  // ---- mark_raw_ingested (flip the frontmatter flag only; body stays append-only) ----
+  server.registerTool(
+    "mark_raw_ingested",
+    {
+      title: "Mark a _raw/ source as ingested",
+      description:
+        "Flip the `ingested` frontmatter flag of a _raw/ source to true AFTER you have integrated it into knowledge pages. Touches only the flag, never the body — _raw/ stays append-only. Closes the ingest loop so lint/planner can see what is still unprocessed.",
+      inputSchema: {
+        path: z.string().describe("Vault-relative path of the _raw/ file."),
+        idempotency_key: idemKey,
+      },
+      annotations: additive,
+    },
+    async (args) => {
+      try {
+        return await applyIdempotent(args.idempotency_key, async () => {
+          const rel = args.path;
+          if (!isUnderRaw(rel)) throw new CoreError("INVALID_NAME", "path must be inside _raw/");
+          await core.mutate({
+            op: "mark_raw_ingested",
+            message: `mark_raw_ingested: ${rel}`,
+            journal: { path: rel },
+            body: async (tx) => {
+              if (!tx.exists(rel)) throw new CoreError("NOT_FOUND", "no such raw file");
+              const parsed = matter(tx.read(rel));
+              parsed.data.ingested = true;
+              tx.writeFile(rel, matter.stringify(parsed.content.replace(/^\n+/, ""), parsed.data));
+            },
+          });
+          return `marked ${rel} ingested: true`;
+        });
+      } catch (err) {
+        return mapError(err, log, "mark_raw_ingested");
+      }
+    },
+  );
+
+  // ---- append_contradiction (one open row in _contradictions.md; schema matches lint) ----
+  server.registerTool(
+    "append_contradiction",
+    {
+      title: "Record a contradiction",
+      description:
+        "Append one row (status 'open') to _contradictions.md when a new source conflicts with recorded knowledge. Creates the table with its header if absent. The user resolves these manually; lint counts the open ones.",
+      inputSchema: {
+        concept: z.string().min(1).describe("The concept the two claims disagree about."),
+        claim_a: z.string().min(1).describe("First claim."),
+        source_a: z.string().min(1).describe("Where claim A came from."),
+        claim_b: z.string().min(1).describe("Second, conflicting claim."),
+        source_b: z.string().min(1).describe("Where claim B came from."),
+        date: z.string().optional().describe("ISO date (defaults to today)."),
+        idempotency_key: idemKey,
+      },
+      annotations: additive,
+    },
+    async (args) => {
+      try {
+        return await applyIdempotent(args.idempotency_key, async () => {
+          const date = args.date ?? new Date().toISOString().slice(0, 10);
+          const cells = [date, args.concept, args.claim_a, args.source_a, args.claim_b, args.source_b, "open"].map(cell);
+          const row = `| ${cells.join(" | ")} |`;
+          await core.mutate({
+            op: "append_contradiction",
+            message: `append_contradiction: ${cell(args.concept)}`,
+            journal: { concept: cell(args.concept) },
+            body: async (tx) => {
+              const prior = tx.exists(CONTRADICTIONS_FILE) ? tx.read(CONTRADICTIONS_FILE) : CONTRADICTIONS_HEADER;
+              const base = prior.endsWith("\n") ? prior : prior + "\n";
+              tx.writeFile(CONTRADICTIONS_FILE, base + row + "\n");
+            },
+          });
+          return `recorded contradiction for "${cell(args.concept)}" (status: open)`;
+        });
+      } catch (err) {
+        return mapError(err, log, "append_contradiction");
+      }
+    },
+  );
+}
+
+const CONTRADICTIONS_FILE = "_contradictions.md";
+const CONTRADICTIONS_HEADER =
+  "# Противоречия\n\n| Дата | Концепт | Утверждение A | Источник A | Утверждение B | Источник B | Статус |\n|---|---|---|---|---|---|---|\n";
+
+/** True if a vault-relative path is inside the append-only _raw/ inbox. */
+function isUnderRaw(rel: string): boolean {
+  const p = rel.replace(/\\/g, "/").replace(/^\.\//, "");
+  return p === "_raw" || p.startsWith("_raw/");
+}
+
+/** Sanitise a value for a markdown table cell (no pipes/newlines break the row). */
+function cell(s: string): string {
+  return s.replace(/\r?\n/g, " ").replace(/\|/g, "\\|").trim();
 }
 
 /** Build a filesystem-safe slug from a title (keeps unicode letters/digits, caps length). */
