@@ -78,6 +78,12 @@ export function registerStructuralTools(server: McpServer, ctx: ToolContext): vo
     },
     async (args) => {
       try {
+        // Surface a destination clash already in the dry-run (the core enforces this too);
+        // a pure case-rename is allowed — on a case-insensitive FS the "existing" path is
+        // the source itself.
+        if (core.pathExists(args.to) && args.from.toLowerCase() !== args.to.toLowerCase()) {
+          throw new CoreError("ALREADY_EXISTS", "destination already exists; refusing to overwrite");
+        }
         const { renames, excluded } = computeRenames(core, args.from, args.to);
         const edits = planBacklinkFixes(core, renames, excluded);
         if (!args.confirm) {

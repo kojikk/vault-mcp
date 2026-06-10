@@ -5,9 +5,15 @@ import {
   readdirSync,
   renameSync,
   mkdirSync,
+  rmSync,
+  appendFileSync,
+  truncateSync,
+  openSync,
+  readSync,
+  closeSync,
 } from "node:fs";
 import path from "node:path";
-import { VaultPaths } from "./paths.js";
+import { VaultPaths, isWithin } from "./paths.js";
 import { WriteGate } from "./lock.js";
 import { VaultGit, type GitIdentity } from "./git.js";
 import { atomicWrite } from "./atomic.js";
@@ -16,6 +22,9 @@ import type { Logger } from "../logger.js";
 
 /** A reserved root-level journal file; appended to by every mutation. */
 const LOG_FILE = "_log.md";
+const LOG_HEADER = "# _log\n\nAppend-only operation journal. Metadata only — never note bodies.\n";
+/** Cap journal target lists so a large folder move cannot bloat a journal line. */
+const JOURNAL_MAX_TARGETS = 20;
 
 export interface TreeNode {
   name: string;
@@ -56,6 +65,23 @@ export interface MutationSpec<T> {
   /** Metadata-only journal note (no file bodies — lesson H-5). */
   journal?: Record<string, string | number | string[]>;
   body: (tx: Tx) => Promise<T>;
+}
+
+/** One reversible step of a transaction; rollback replays these in LIFO order. */
+type UndoStep = () => void;
+
+/** All regular files under a directory (absolute paths), including dotfiles. */
+function walkFilesAbs(absDir: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string) => {
+    for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.isFile()) out.push(p);
+    }
+  };
+  walk(absDir);
+  return out;
 }
 
 export class VaultCore {
@@ -156,17 +182,21 @@ export class VaultCore {
 
   /**
    * Run a mutation atomically: acquire the vault lock, execute the body, append a
-   * metadata-only journal line, then commit all touched paths. On any error, roll the
-   * touched paths back to HEAD so the vault is never left half-written (techplan §4).
+   * metadata-only journal line, then commit all touched paths. On any error, replay the
+   * transaction's undo log (LIFO) so the vault is never left half-written (techplan §4).
+   * The undo log — not `git checkout` — is the rollback mechanism: it restores files that
+   * never existed in HEAD (new creations, files a human added but no mutation committed yet)
+   * and reverses moves by renaming back, so no content can be lost on rollback.
    */
   async mutate<T>(spec: MutationSpec<T>): Promise<T> {
     return this.gate.run(async () => {
       const touched = new Set<string>();
-      const tx = this.makeTx(touched);
+      const undo: UndoStep[] = [];
+      const tx = this.makeTx(touched, undo);
       try {
         const result = await spec.body(tx);
-        this.appendJournal(spec.op, spec.journal, touched);
-        const commitPaths = [...touched, LOG_FILE];
+        this.appendJournal(spec.op, spec.journal, touched, undo);
+        const commitPaths = [...touched];
         const oid = await this.git.commit(spec.message, commitPaths);
         this.log.info("mutation", {
           op: spec.op,
@@ -175,8 +205,7 @@ export class VaultCore {
         });
         return result;
       } catch (err) {
-        // Roll back the working tree for everything we touched.
-        await this.git.checkoutHead([...touched]).catch(() => undefined);
+        this.rollback(undo, spec.op);
         this.log.warn("mutation_failed", {
           op: spec.op,
           touchedCount: touched.size,
@@ -187,18 +216,58 @@ export class VaultCore {
     });
   }
 
-  private makeTx(touched: Set<string>): Tx {
+  /** Replay undo steps newest-first; a failing step is logged but does not stop the rest. */
+  private rollback(undo: UndoStep[], op: string): void {
+    for (let i = undo.length - 1; i >= 0; i--) {
+      try {
+        undo[i]!();
+      } catch (err) {
+        this.log.warn("rollback_step_failed", { op, step: i, reason: (err as Error).message });
+      }
+    }
+  }
+
+  private makeTx(touched: Set<string>, undo: UndoStep[]): Tx {
     const record = (abs: string) => touched.add(this.paths.toRel(abs));
+
+    // git tracks files, not directories: when a directory moves, stage each contained
+    // file's old and new path so deletions actually land in the commit (a directory
+    // path handed to git.add/git.remove is silently useless — the v0.1 folder-move bug).
+    const recordMovedFiles = (fromAbs: string, toAbs: string, srcIsDir: boolean) => {
+      if (!srcIsDir) {
+        record(fromAbs);
+        record(toAbs);
+        return;
+      }
+      // Called BEFORE the rename: walk the source while it still exists.
+      for (const f of walkFilesAbs(fromAbs)) {
+        record(f);
+        record(path.join(toAbs, path.relative(fromAbs, f)));
+      }
+    };
+
     return {
       writeFile: (rel, contents) => {
         const abs = this.paths.resolveForWrite(rel);
+        const prior = existsSync(abs) ? readFileSync(abs, "utf8") : null;
         atomicWrite(abs, contents);
+        undo.push(() => {
+          if (prior === null) rmSync(abs, { force: true });
+          else atomicWrite(abs, prior);
+        });
         record(abs);
       },
       mkdir: (rel) => {
         const abs = this.paths.resolveDir(rel);
+        if (existsSync(abs)) return;
+        // Undo must remove exactly what this call creates: the topmost ancestor that
+        // does not exist yet (mkdirSync recursive creates the whole chain).
+        let top = abs;
+        for (let parent = path.dirname(top); !existsSync(parent) && isWithin(this.paths.root, parent); parent = path.dirname(top)) {
+          top = parent;
+        }
         mkdirSync(abs, { recursive: true });
-        record(abs);
+        undo.push(() => rmSync(top, { recursive: true, force: true }));
       },
       move: (fromRel, toRel) => {
         const fromAbs = this.paths.resolveExisting(fromRel);
@@ -206,10 +275,19 @@ export class VaultCore {
         // the source; choose by the source kind.
         const srcIsDir = statSync(fromAbs).isDirectory();
         const toAbs = srcIsDir ? this.paths.resolveDir(toRel) : this.paths.resolveForWrite(toRel);
+        // Refuse to clobber an existing destination — except a pure case-rename, where a
+        // case-insensitive filesystem reports the source itself as "existing".
+        const caseRenameOnly = fromAbs.toLowerCase() === toAbs.toLowerCase();
+        if (existsSync(toAbs) && !caseRenameOnly) {
+          throw new CoreError("ALREADY_EXISTS", "destination already exists; refusing to overwrite");
+        }
+        recordMovedFiles(fromAbs, toAbs, srcIsDir);
         mkdirSync(path.dirname(toAbs), { recursive: true });
         renameSync(fromAbs, toAbs);
-        record(fromAbs);
-        record(toAbs);
+        undo.push(() => {
+          mkdirSync(path.dirname(fromAbs), { recursive: true });
+          renameSync(toAbs, fromAbs);
+        });
       },
       read: (rel) => this.readTextFile(rel),
       exists: (rel) => this.pathExists(rel),
@@ -221,27 +299,61 @@ export class VaultCore {
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const destRel = path.posix.join(".trash", stamp, this.paths.toRel(fromAbs));
         const destAbs = path.join(this.paths.root, destRel);
+        const srcIsDir = statSync(fromAbs).isDirectory();
+        recordMovedFiles(fromAbs, destAbs, srcIsDir);
         mkdirSync(path.dirname(destAbs), { recursive: true });
         renameSync(fromAbs, destAbs);
-        record(fromAbs);
-        touched.add(destRel);
+        undo.push(() => {
+          mkdirSync(path.dirname(fromAbs), { recursive: true });
+          renameSync(destAbs, fromAbs);
+        });
         return destRel;
       },
     };
   }
 
+  /**
+   * Append one metadata line to the journal. True O(1) append (the file is never read or
+   * rewritten whole — it grows for the life of the vault), with an undo step that truncates
+   * back to the prior size so a failed commit does not leave a phantom journal entry.
+   */
   private appendJournal(
     op: string,
     journal: Record<string, string | number | string[]> | undefined,
     touched: Set<string>,
+    undo: UndoStep[],
   ): void {
     const logAbs = path.join(this.paths.root, LOG_FILE);
-    const prior = existsSync(logAbs) ? readFileSync(logAbs, "utf8") : "# _log\n\nAppend-only operation journal. Metadata only — never note bodies.\n";
+    const existed = existsSync(logAbs);
+    const priorSize = existed ? statSync(logAbs).size : 0;
+
+    // A human-edited journal may lack a trailing newline; check the last byte only.
+    let needsNewline = false;
+    if (existed && priorSize > 0) {
+      const fd = openSync(logAbs, "r");
+      try {
+        const last = Buffer.alloc(1);
+        readSync(fd, last, 0, 1, priorSize - 1);
+        needsNewline = last[0] !== 0x0a;
+      } finally {
+        closeSync(fd);
+      }
+    }
+
     const ts = new Date().toISOString();
     const targets = [...touched].filter((p) => p !== LOG_FILE);
+    const shown = targets.length > JOURNAL_MAX_TARGETS
+      ? [...targets.slice(0, JOURNAL_MAX_TARGETS), `…+${targets.length - JOURNAL_MAX_TARGETS} more`]
+      : targets;
     const meta = journal ? " " + JSON.stringify(journal) : "";
-    const line = `- ${ts} · ${op} · ${targets.join(", ") || "(none)"}${meta}\n`;
-    atomicWrite(logAbs, prior.endsWith("\n") ? prior + line : prior + "\n" + line);
+    const line = `- ${ts} · ${op} · ${shown.join(", ") || "(none)"}${meta}\n`;
+
+    const chunk = (existed ? (needsNewline ? "\n" : "") : LOG_HEADER) + line;
+    appendFileSync(logAbs, chunk, "utf8");
+    undo.push(() => {
+      if (existed) truncateSync(logAbs, priorSize);
+      else rmSync(logAbs, { force: true });
+    });
     touched.add(LOG_FILE);
   }
 }

@@ -254,9 +254,7 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext, ledger: 
             journal: { path: rel },
             body: async (tx) => {
               if (!tx.exists(rel)) throw new CoreError("NOT_FOUND", "no such raw file");
-              const parsed = matter(tx.read(rel));
-              parsed.data.ingested = true;
-              tx.writeFile(rel, matter.stringify(parsed.content.replace(/^\n+/, ""), parsed.data));
+              tx.writeFile(rel, setIngestedTrue(tx.read(rel)));
             },
           });
           return `marked ${rel} ingested: true`;
@@ -313,6 +311,26 @@ export function registerWriteTools(server: McpServer, ctx: ToolContext, ledger: 
 const CONTRADICTIONS_FILE = "_contradictions.md";
 const CONTRADICTIONS_HEADER =
   "# Противоречия\n\n| Дата | Концепт | Утверждение A | Источник A | Утверждение B | Источник B | Статус |\n|---|---|---|---|---|---|---|\n";
+
+/**
+ * Flip the `ingested` frontmatter flag to true by patching the exact line, never
+ * re-serializing the document: round-tripping through a YAML emitter rewrites quoting,
+ * date formats and leading whitespace, which breaks the "_raw is byte-stable" contract.
+ * A raw file dropped in by hand without frontmatter gets a minimal block prepended.
+ */
+function setIngestedTrue(content: string): string {
+  const fm = content.match(/^(---\r?\n)([\s\S]*?)(\r?\n---(?:\r?\n|$))/);
+  if (!fm) return `---\ningested: true\n---\n${content}`;
+  const [whole, open, body, close] = fm as unknown as [string, string, string, string];
+  const flagLine = /^(ingested\s*:).*$/m;
+  const newBody = flagLine.test(body) ? body.replace(flagLine, "$1 true") : `${body}\ningested: true`;
+  const patched = open + newBody + close + content.slice(whole.length);
+  // Defense in depth: the patched frontmatter must still parse with the flag set.
+  if ((matter(patched).data as Record<string, unknown>).ingested !== true) {
+    throw new CoreError("INVALID_NAME", "could not set the ingested flag in this file's frontmatter");
+  }
+  return patched;
+}
 
 /** True if a vault-relative path is inside the append-only _raw/ inbox. */
 function isUnderRaw(rel: string): boolean {

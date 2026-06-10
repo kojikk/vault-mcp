@@ -78,14 +78,4 @@ export class VaultGit {
     // [filepath, HEAD, WORKDIR, STAGE]; staged change when STAGE !== HEAD.
     return matrix.some(([, head, , stage]) => stage !== head);
   }
-
-  /** Revert the working tree of the given paths to HEAD (transaction rollback helper). */
-  async checkoutHead(relPaths: string[]): Promise<void> {
-    await git.checkout({
-      fs,
-      dir: this.dir,
-      force: true,
-      filepaths: relPaths,
-    }).catch(() => undefined);
-  }
 }

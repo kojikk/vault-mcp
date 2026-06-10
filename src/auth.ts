@@ -29,12 +29,15 @@ function constantTimeEqual(a: string, b: string): boolean {
 }
 
 function clientIp(req: Request): string {
-  // Behind Caddy on loopback; trust the proxy's forwarded IP only for lockout bucketing,
-  // never for auth decisions.
-  const fwd = req.headers["x-forwarded-for"];
-  if (typeof fwd === "string" && fwd.length > 0) return fwd.split(",")[0]!.trim();
+  // req.ip honours Express's `trust proxy` setting: X-Forwarded-For counts only when the
+  // request actually came through the loopback proxy (Caddy). Reading the header directly
+  // would let a directly-connected client spoof its lockout bucket — rotate XFF to dodge
+  // the lockout, or set a victim's address to lock them out.
   return req.ip ?? req.socket.remoteAddress ?? "unknown";
 }
+
+/** Hard cap on tracked client addresses so an address-rotating client cannot grow the map. */
+const MAX_TRACKED_IPS = 10_000;
 
 export function makeAuthMiddleware(config: Config, log: Logger) {
   const expectedDigest = digest(config.token);
@@ -53,6 +56,19 @@ export function makeAuthMiddleware(config: Config, log: Logger) {
 
     const header = req.headers.authorization;
     const fail = (reason: string) => {
+      if (!attempts.has(ip) && attempts.size >= MAX_TRACKED_IPS) {
+        // Prefer dropping records whose lockout has expired; fall back to the oldest.
+        for (const [k, v] of attempts) {
+          if (v.lockedUntil <= now) {
+            attempts.delete(k);
+            break;
+          }
+        }
+        if (attempts.size >= MAX_TRACKED_IPS) {
+          const oldest = attempts.keys().next().value;
+          if (oldest !== undefined) attempts.delete(oldest);
+        }
+      }
       const a = attempts.get(ip) ?? { fails: 0, lockedUntil: 0 };
       a.fails += 1;
       if (a.fails >= lockoutThreshold) {

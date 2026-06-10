@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
+import fs from "node:fs";
+import git from "isomorphic-git";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -85,6 +87,79 @@ describe("move with backlink repair", () => {
     expect(existsSync(path.join(vaultRoot, "b.md"))).toBe(false);
     expect(existsSync(path.join(vaultRoot, "c.md"))).toBe(true);
     expect(readFileSync(path.join(vaultRoot, "a.md"), "utf8")).toContain("[[c]]");
+  });
+});
+
+describe("move safety", () => {
+  it("refuses to overwrite an existing destination", async () => {
+    await text("create_note", { path: "src-ow.md", content: "SOURCE" });
+    await text("create_note", { path: "dst-ow.md", content: "DEST" });
+    const res = await text("move", { from: "src-ow.md", to: "dst-ow.md", confirm: true });
+    expect(res).toContain("ALREADY_EXISTS");
+    expect(readFileSync(path.join(vaultRoot, "src-ow.md"), "utf8")).toContain("SOURCE");
+    expect(readFileSync(path.join(vaultRoot, "dst-ow.md"), "utf8")).toContain("DEST");
+  });
+
+  it("folder move stages deletions of the old paths (clean git status)", async () => {
+    await text("create_node", { path: "Area" });
+    await text("create_note", { path: "Area/n1.md", content: "one" });
+    await text("create_note", { path: "Area/n2.md", content: "two" });
+    await text("move", { from: "Area", to: "Zone", confirm: true });
+
+    const matrix = await git.statusMatrix({ fs, dir: vaultRoot });
+    // Old paths must be fully gone from HEAD, the index and the worktree…
+    expect(matrix.filter(([f]) => f.startsWith("Area/"))).toEqual([]);
+    // …and the new paths must be committed clean ([head, workdir, stage] = [1, 1, 1]).
+    const moved = matrix.filter(([f]) => f.startsWith("Zone/"));
+    expect(moved.length).toBeGreaterThanOrEqual(2);
+    expect(moved.every(([, head, workdir, stage]) => head === 1 && workdir === 1 && stage === 1)).toBe(true);
+  });
+
+  it("folder soft_delete stages deletions of the old paths", async () => {
+    await text("create_node", { path: "Doomed" });
+    await text("create_note", { path: "Doomed/x.md", content: "x" });
+    await text("soft_delete", { path: "Doomed", confirm: true });
+
+    const matrix = await git.statusMatrix({ fs, dir: vaultRoot });
+    expect(matrix.filter(([f]) => f.startsWith("Doomed/"))).toEqual([]);
+    const trashed = matrix.filter(([f]) => f.startsWith(".trash/"));
+    expect(trashed.length).toBeGreaterThanOrEqual(3); // _home, _memory, x.md
+    expect(trashed.every(([, head, workdir, stage]) => head === 1 && workdir === 1 && stage === 1)).toBe(true);
+  });
+});
+
+describe("transaction rollback", () => {
+  it("a failing promote restores moved files and removes created scaffolding", async () => {
+    await text("create_node", { path: "Proj2" });
+    await text("create_note", { path: "Proj2/t1.md", content: "topic one" });
+
+    // The second file does not exist: the transaction fails AFTER t1 was moved and the
+    // child node scaffolding was written — everything must be rolled back.
+    const res = await text("promote", {
+      node: "Proj2",
+      children: [{ name: "Sub", files: ["Proj2/t1.md", "Proj2/missing.md"] }],
+      confirm: true,
+    });
+    expect(res).toContain("NOT_FOUND");
+
+    expect(readFileSync(path.join(vaultRoot, "Proj2", "t1.md"), "utf8")).toContain("topic one");
+    expect(existsSync(path.join(vaultRoot, "Proj2", "Sub"))).toBe(false);
+
+    // No half-written state leaked into git either.
+    const matrix = await git.statusMatrix({ fs, dir: vaultRoot });
+    expect(matrix.filter(([f]) => f.startsWith("Proj2/Sub"))).toEqual([]);
+  });
+
+  it("a failed mutation leaves no phantom journal entry", async () => {
+    await text("create_note", { path: "j.md", content: "x" });
+    const logBefore = readFileSync(path.join(vaultRoot, "_log.md"), "utf8");
+    await text("promote", {
+      node: "Proj3",
+      children: [{ name: "S", files: ["Proj3/nope.md"] }],
+      confirm: true,
+    });
+    const logAfter = readFileSync(path.join(vaultRoot, "_log.md"), "utf8");
+    expect(logAfter).toBe(logBefore);
   });
 });
 
@@ -227,6 +302,20 @@ describe("ingest primitives", () => {
     const body = readFileSync(path.join(vaultRoot, rawRel), "utf8");
     expect(body).toContain("ingested: true");
     expect(body).toContain("тело сырья остаётся");
+  });
+
+  it("mark_raw_ingested flips the flag byte-precisely without reformatting frontmatter", async () => {
+    const res = await text("add_raw", {
+      content: "тело сырья",
+      title: "Заголовок: с двоеточием",
+      source: "https://example.com/a?b=1",
+    });
+    const rawRel = res.match(/_raw\/notes\/[^\s]+\.md/)![0];
+    const before = readFileSync(path.join(vaultRoot, rawRel), "utf8");
+    await text("mark_raw_ingested", { path: rawRel });
+    const after = readFileSync(path.join(vaultRoot, rawRel), "utf8");
+    // The ONLY difference is the flag line — quoting, dates and body are untouched.
+    expect(after).toBe(before.replace("ingested: false", "ingested: true"));
   });
 
   it("mark_raw_ingested rejects paths outside _raw/", async () => {

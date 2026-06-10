@@ -23,9 +23,13 @@ function testConfig(overrides: Partial<Config> = {}): Config {
   };
 }
 
-async function withServer(config: Config, fn: (base: string) => Promise<void>) {
+async function withServer(
+  config: Config,
+  fn: (base: string) => Promise<void>,
+  trustProxy: boolean | string = "loopback",
+) {
   const app = express();
-  app.set("trust proxy", "loopback");
+  app.set("trust proxy", trustProxy);
   app.post("/mcp", makeAuthMiddleware(config, silent), express.json(), (_req, res) => res.json({ ok: true }));
   const server = app.listen(0, "127.0.0.1");
   await new Promise<void>((r) => server.once("listening", () => r()));
@@ -73,6 +77,32 @@ describe("auth middleware (C-4)", () => {
       const res = await fetch(`${base}/mcp?token=${config.token}`, { method: "POST" });
       expect(res.status).toBe(401);
     });
+  });
+
+  it("ignores spoofed X-Forwarded-For when the sender is not a trusted proxy", async () => {
+    const config = testConfig({ rateLimit: { windowMs: 60000, max: 1000, lockoutThreshold: 3, lockoutMs: 60000 } });
+    await withServer(
+      config,
+      async (base) => {
+        // Rotating XFF must NOT rotate the lockout bucket: all failures land on the
+        // real socket address, so the lockout still triggers.
+        for (let i = 0; i < 3; i++) {
+          await fetch(`${base}/mcp`, {
+            method: "POST",
+            headers: {
+              Authorization: "Bearer nope-nope-nope-nope-nope-nope",
+              "X-Forwarded-For": `10.0.0.${i + 1}`,
+            },
+          });
+        }
+        const res = await fetch(`${base}/mcp`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.token}` },
+        });
+        expect(res.status).toBe(429);
+      },
+      false, // direct exposure: no trusted proxy
+    );
   });
 
   it("locks out after the failure threshold", async () => {
