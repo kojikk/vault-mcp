@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ToolContext } from "./context.js";
@@ -184,6 +185,68 @@ export function registerGraphTools(server: McpServer, ctx: ToolContext, ledger: 
         );
       } catch (err) {
         return mapError(err, log, "graph_stats");
+      }
+    },
+  );
+
+  server.registerTool(
+    "graph_export",
+    {
+      title: "Export the full graph as JSON",
+      description:
+        "Machine-readable dump of the WHOLE graph (nodes, edges, communities, file mtimes) for visualization UIs. " +
+        "Do NOT call this while reasoning over the vault — the output is large and unranked; use graph_query/graph_neighbors instead.",
+      inputSchema: {},
+      annotations: readOnly,
+    },
+    async () => {
+      try {
+        const graph = index.get();
+        const { assignment } = detectCommunities(graph);
+
+        // mtime of the backing file marks a node as recently touched in the viewer.
+        // Org nodes are folders — their _home.md stands in for the folder itself.
+        const mtimeOf = (n: { id: string; kind: string }): string | undefined => {
+          const rel = n.kind === "note" ? n.id : n.kind === "org" ? `${n.id}/_home.md` : null;
+          if (rel === null) return undefined;
+          try {
+            return statSync(ctx.core.resolveForRead(rel)).mtime.toISOString();
+          } catch {
+            return undefined;
+          }
+        };
+
+        const nodes = [...graph.nodes.values()].map((n) => {
+          const mtime = mtimeOf(n);
+          return {
+            id: n.id,
+            kind: n.kind,
+            label: sanitize(n.label, 120),
+            entity: n.entity,
+            degree: graph.adjacency.get(n.id)?.length ?? 0,
+            community: assignment.get(n.id) ?? null,
+            ...(mtime ? { mtime } : {}),
+          };
+        });
+        const edges = graph.edges.map((e) => ({
+          src: e.src,
+          tgt: e.tgt,
+          relation: sanitize(e.relation, 80),
+          layer: e.layer,
+          confidence: e.confidence,
+          ...(e.created ? { created: e.created } : {}),
+        }));
+
+        return textResult(
+          JSON.stringify({
+            generated: new Date().toISOString(),
+            stats: { nodes: nodes.length, edges: edges.length, semanticSkipped: graph.semanticSkipped },
+            nodes,
+            edges,
+          }),
+        );
+      } catch (err) {
+        return mapError(err, log, "graph_export");
       }
     },
   );

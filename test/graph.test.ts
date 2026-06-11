@@ -273,6 +273,30 @@ describe("graph query tools", () => {
   });
 });
 
+// --------------------------- graph_export ---------------------------
+
+describe("graph_export", () => {
+  it("dumps nodes with degree/community/mtime and edges with layer/created", async () => {
+    file("Знания/AI/RAG.md", "---\ntype: entity\n---\nИспользует [[Эмбеддинги]].");
+    file("Знания/AI/Эмбеддинги.md", "---\ntype: entity\n---\nВекторы.");
+    await text("graph_upsert", {
+      edges: [{ src: "Знания/AI/RAG.md", tgt: "Знания/AI/Эмбеддинги.md", relation: "использует" }],
+    });
+
+    const out = JSON.parse(await text("graph_export"));
+    expect(out.stats.nodes).toBeGreaterThanOrEqual(2);
+    const rag = out.nodes.find((n: { id: string }) => n.id === "Знания/AI/RAG.md");
+    expect(rag.entity).toBe(true);
+    expect(rag.degree).toBeGreaterThanOrEqual(2); // derived link + semantic edge
+    expect(rag.mtime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(rag.community).not.toBeNull();
+
+    const sem = out.edges.find((e: { layer: string }) => e.layer === "semantic");
+    expect(sem.relation).toBe("использует");
+    expect(sem.created).toMatch(/^\d{4}-\d{2}-\d{2}/); // graph_upsert stamps the date
+  });
+});
+
 // --------------------------- communities ---------------------------
 
 describe("communities", () => {

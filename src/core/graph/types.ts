@@ -42,6 +42,8 @@ export interface GraphEdge {
   layer: EdgeLayer;
   /** For semantic edges: the note/source the claim came from, if recorded. */
   sourceNote?: string;
+  /** For semantic edges: ISO date the edge was recorded (drives "what's new" in viewers). */
+  created?: string;
 }
 
 /** Assembled, queryable in-memory graph (see assemble.ts). */
