@@ -7,6 +7,8 @@ import { textResult, mapError } from "./context.js";
 import { wrapUntrusted } from "./untrusted.js";
 import { search } from "../core/search.js";
 import { runLint } from "../core/lint.js";
+import { godNodes } from "../core/graph/communities.js";
+import { sanitize } from "../core/graph/render.js";
 
 /**
  * Phase 1 — read & search tools. All are marked read-only and idempotent. Any output that
@@ -16,6 +18,21 @@ import { runLint } from "../core/lint.js";
 export function registerReadTools(server: McpServer, ctx: ToolContext): void {
   const { core, log } = ctx;
   const readOnly = { readOnlyHint: true, idempotentHint: true, openWorldHint: false } as const;
+
+  // Compact graph digest appended to read_hot: the first tool every session calls is the
+  // one place the graph is guaranteed to be seen (GRAPH-PLAN.md §8.1). Counts are vault
+  // metadata; god-node labels are content and go inside an untrusted block. Hard cap keeps
+  // the reading-ladder cost flat; any failure degrades to no digest, never a broken read_hot.
+  const graphDigest = (): string => {
+    const graph = ctx.graph.get();
+    if (graph.nodes.size === 0) return "";
+    const semantic = graph.edges.filter((e) => e.layer === "semantic").length;
+    const top = godNodes(graph, 5)
+      .map((g) => sanitize(graph.nodes.get(g.id)?.label ?? g.id, 40))
+      .join(", ");
+    const counts = `\n\nГРАФ: ${graph.nodes.size} узлов, ${graph.edges.length} рёбер (semantic: ${semantic}). Связи области вопроса — graph_query.`;
+    return top ? `${counts}\n${wrapUntrusted("graph-digest", `Самые связанные: ${top}`)}` : counts;
+  };
 
   server.registerTool(
     "vault_tree",
@@ -120,7 +137,13 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
     async () => {
       try {
         const body = core.pathExists("_hot.md") ? core.readTextFile("_hot.md") : "(empty: no _hot.md yet)";
-        return textResult(wrapUntrusted("_hot.md", body));
+        let digest = "";
+        try {
+          digest = graphDigest();
+        } catch (err) {
+          log.warn("graph_digest_failed", { reason: (err as Error).message });
+        }
+        return textResult(wrapUntrusted("_hot.md", body) + digest);
       } catch (err) {
         return mapError(err, log, "read_hot");
       }
@@ -249,17 +272,22 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Audit vault health",
       description:
-        "Read-only health report (agent.md §13): orphan pages, broken [[links]], stale entity pages, unprocessed _raw/ sources, and open contradictions. Nothing is changed — the brain decides what to fix. Returns structural metadata (paths/counts).",
+        "Read-only health report (agent.md §13): orphan pages, broken [[links]], stale entity pages, unprocessed _raw/ sources, open contradictions, and graph health (semantic edges to missing pages, uncovered entities, concept candidates). Nothing is changed — the brain decides what to fix. Returns structural metadata (paths/counts).",
       inputSchema: {},
       annotations: readOnly,
     },
     async () => {
       try {
-        const report = runLint(core);
+        const report = runLint(core, ctx.graph.get());
+        const g = report.graph;
         const summary =
           `orphans: ${report.orphans.length}, brokenLinks: ${report.brokenLinks.length}, ` +
           `staleEntities: ${report.staleEntities.length}, unlinkedRaw: ${report.unlinkedRaw.length}, ` +
-          `openContradictions: ${report.openContradictions}`;
+          `openContradictions: ${report.openContradictions}` +
+          (g
+            ? `, graphBrokenEndpoints: ${g.brokenEdgeEndpoints.length}, graphUncoveredEntities: ${g.uncoveredEntities.length}, ` +
+              `conceptCandidates: ${g.conceptCandidates.length}, entityCoverage: ${g.entityCoveragePct}%`
+            : "");
         return textResult(`${summary}\n${JSON.stringify(report, null, 2)}`);
       } catch (err) {
         return mapError(err, log, "lint");

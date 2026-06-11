@@ -1,10 +1,13 @@
 import type { VaultCore } from "../core/vault-core.js";
+import type { GraphIndex } from "../core/graph/assemble.js";
 import type { Logger } from "../logger.js";
 import { isCoreError } from "../core/errors.js";
 
 /** Shared dependencies handed to every tool handler. */
 export interface ToolContext {
   core: VaultCore;
+  /** Process-lifetime graph index (invalidated by the core's mutation listener). */
+  graph: GraphIndex;
   log: Logger;
 }
 

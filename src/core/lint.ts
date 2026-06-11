@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import matter from "gray-matter";
 import type { VaultCore, TreeNode } from "./vault-core.js";
+import type { Graph } from "./graph/types.js";
 
 /**
  * Vault health audit (agent.md §13). Read-only: it never mutates, it just reports. The brain
@@ -12,6 +13,8 @@ import type { VaultCore, TreeNode } from "./vault-core.js";
  *   3. staleEntities    — type:entity pages whose `updated` is older than ~3 months (or missing)
  *   4. unlinkedRaw      — files in _raw/ not referenced from outside _raw/ (ingest not done)
  *   5. openContradictions — rows in _contradictions.md still marked `open`
+ *   6. graph (when an assembled graph is supplied) — semantic edges pointing at missing pages,
+ *      entity pages with no semantic edges, and bare concepts awaiting an entity page
  */
 
 const STALE_DAYS = 90;
@@ -25,6 +28,20 @@ export interface LintReport {
   staleEntities: { file: string; updated: string; ageDays: number }[];
   unlinkedRaw: string[];
   openContradictions: number;
+  graph?: GraphLintSection;
+}
+
+export interface GraphLintSection {
+  /** Semantic-edge endpoints recorded as a path but resolving to no page (page moved/deleted). */
+  brokenEdgeEndpoints: string[];
+  /** Entity pages with zero semantic edges — knowledge the graph layer does not cover yet. */
+  uncoveredEntities: string[];
+  /** Bare concept labels in use (no page) — candidates for an entity page. */
+  conceptCandidates: string[];
+  /** Malformed lines skipped while loading _system/graph-edges.md. */
+  semanticSkipped: number;
+  /** entity pages covered / total entity pages, in percent (100 when there are none). */
+  entityCoveragePct: number;
 }
 
 function isUnder(rel: string, dir: string): boolean {
@@ -55,7 +72,44 @@ function extractTargets(content: string): string[] {
   return targets;
 }
 
-export function runLint(core: VaultCore): LintReport {
+/**
+ * Graph health, computed from the same assembled graph the query tools use — so lint and
+ * graph_query can never disagree about what resolves. Path-like concept labels (containing
+ * '/' or '.md') mean a semantic edge was recorded against a page that no longer exists.
+ */
+export function graphLintSection(graph: Graph): GraphLintSection {
+  const brokenEdgeEndpoints: string[] = [];
+  const conceptCandidates: string[] = [];
+  for (const node of graph.nodes.values()) {
+    if (node.kind !== "concept") continue;
+    const degree = (graph.adjacency.get(node.id) ?? []).length;
+    if (degree === 0) continue;
+    if (/[/\\]|\.md$/i.test(node.label)) brokenEdgeEndpoints.push(node.label);
+    else conceptCandidates.push(node.label);
+  }
+
+  let entities = 0;
+  const covered = new Set<string>();
+  for (const node of graph.nodes.values()) {
+    if (!node.entity) continue;
+    entities++;
+    const incident = graph.adjacency.get(node.id) ?? [];
+    if (incident.some(({ edge }) => edge.layer === "semantic")) covered.add(node.id);
+  }
+  const uncoveredEntities = [...graph.nodes.values()]
+    .filter((n) => n.entity && !covered.has(n.id))
+    .map((n) => n.id);
+
+  return {
+    brokenEdgeEndpoints: brokenEdgeEndpoints.sort(),
+    uncoveredEntities: uncoveredEntities.sort(),
+    conceptCandidates: conceptCandidates.sort(),
+    semanticSkipped: graph.semanticSkipped,
+    entityCoveragePct: entities === 0 ? 100 : Math.round((covered.size / entities) * 100),
+  };
+}
+
+export function runLint(core: VaultCore, graph?: Graph): LintReport {
   const files = allFiles(core);
   const mdFiles = files.filter((f) => f.toLowerCase().endsWith(".md"));
 
@@ -178,5 +232,12 @@ export function runLint(core: VaultCore): LintReport {
     }
   }
 
-  return { orphans, brokenLinks, staleEntities, unlinkedRaw, openContradictions };
+  return {
+    orphans,
+    brokenLinks,
+    staleEntities,
+    unlinkedRaw,
+    openContradictions,
+    ...(graph ? { graph: graphLintSection(graph) } : {}),
+  };
 }

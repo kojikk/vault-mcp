@@ -89,6 +89,8 @@ export class VaultCore {
   private readonly gate: WriteGate;
   private readonly git: VaultGit;
   private readonly log: Logger;
+  /** Invoked after every successful mutation (e.g. graph cache invalidation). */
+  private mutationListener: (() => void) | null = null;
 
   constructor(opts: {
     vaultRoot: string;
@@ -106,6 +108,11 @@ export class VaultCore {
     await this.git.ensureRepo();
   }
 
+  /** Register the single post-mutation hook. A throwing listener never fails the mutation. */
+  onMutation(listener: () => void): void {
+    this.mutationListener = listener;
+  }
+
   // ----------------------------- read side -----------------------------
 
   readTextFile(rel: string): string {
@@ -113,6 +120,17 @@ export class VaultCore {
     const st = statSync(abs);
     if (!st.isFile()) throw new CoreError("NOT_A_FILE", "not a file");
     return readFileSync(abs, "utf8");
+  }
+
+  /** Read a binary file (e.g. a PDF in _attachments/) with a hard size cap. */
+  readBinaryFile(rel: string, maxBytes: number): Buffer {
+    const abs = this.paths.resolveExisting(rel);
+    const st = statSync(abs);
+    if (!st.isFile()) throw new CoreError("NOT_A_FILE", "not a file");
+    if (st.size > maxBytes) {
+      throw new CoreError("INVALID_NAME", `file is too large (${st.size} bytes; cap is ${maxBytes})`);
+    }
+    return readFileSync(abs);
   }
 
   statKind(rel: string): "file" | "dir" {
@@ -203,6 +221,11 @@ export class VaultCore {
           touchedCount: touched.size,
           commit: oid ? oid.slice(0, 10) : "none",
         });
+        try {
+          this.mutationListener?.();
+        } catch (err) {
+          this.log.warn("mutation_listener_failed", { op: spec.op, reason: (err as Error).message });
+        }
         return result;
       } catch (err) {
         this.rollback(undo, spec.op);

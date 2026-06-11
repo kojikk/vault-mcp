@@ -7,6 +7,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { VaultCore } from "../src/core/vault-core.js";
+import { GraphIndex } from "../src/core/graph/assemble.js";
 import { makeServerFactory } from "../src/mcp.js";
 
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
@@ -27,7 +28,9 @@ beforeEach(async () => {
   vaultRoot = realpathSync(mkdtempSync(path.join(tmpdir(), "vault-it-")));
   core = new VaultCore({ vaultRoot, git: { name: "t", email: "t@t" }, logger: silent });
   await core.init();
-  const makeServer = makeServerFactory({ core, log: silent });
+  const graph = new GraphIndex(core);
+  core.onMutation(() => graph.invalidate());
+  const makeServer = makeServerFactory({ core, graph, log: silent });
   const server = makeServer();
   const [clientT, serverT] = InMemoryTransport.createLinkedPair();
   await server.connect(serverT);

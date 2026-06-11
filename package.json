@@ -1,6 +1,6 @@
 {
   "name": "vault-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Vault MCP — thin, no-egress transport over a single Obsidian vault",
   "type": "module",
@@ -23,8 +23,11 @@
     "@vscode/ripgrep": "1.18.0",
     "express": "5.2.1",
     "express-rate-limit": "8.5.2",
+    "graphology": "0.26.0",
+    "graphology-communities-louvain": "2.0.2",
     "gray-matter": "4.0.3",
     "isomorphic-git": "1.38.4",
+    "pdfjs-dist": "6.0.227",
     "proper-lockfile": "4.1.2",
     "zod": "3.25.76"
   },

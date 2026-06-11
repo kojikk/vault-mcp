@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { loadConfig, ConfigError } from "./config.js";
 import { createLogger } from "./logger.js";
 import { VaultCore } from "./core/vault-core.js";
+import { GraphIndex } from "./core/graph/assemble.js";
 import { makeServerFactory } from "./mcp.js";
 
 /**
@@ -45,7 +46,10 @@ async function main(): Promise<void> {
   });
   await core.init();
 
-  const makeServer = makeServerFactory({ core, log });
+  const graph = new GraphIndex(core);
+  core.onMutation(() => graph.invalidate());
+
+  const makeServer = makeServerFactory({ core, graph, log });
   const server = makeServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
