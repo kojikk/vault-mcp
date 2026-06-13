@@ -25,6 +25,7 @@
 import { readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, statSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 
 // ----------------------------- args -----------------------------
 
@@ -38,6 +39,7 @@ function parseArgs(argv) {
     else if (a === "--repo") out.repo = next();
     else if (a === "--from") out.from = next();
     else if (a === "--graphify-out") out.graphifyOut = next();
+    else if (a === "--db") out.db = next();
     else if (a === "--no-commit") out.commit = false;
     else if (a === "-h" || a === "--help") out.help = true;
     else die(`unknown argument: ${a}`);
@@ -55,9 +57,15 @@ const HELP = `codegraph-sync — sync a project's code graph into a vault code n
   --project <name>     required; [a-z0-9][a-z0-9-]* — the namespace id (code:<name>)
   --vault <path>       required; the Obsidian vault root
   --repo <path>        project root to scan / find graphify-out (default: cwd)
-  --from <src>         graphify (default) | ts-naive
+  --from <src>         codegraph | graphify (default) | ts-naive
   --graphify-out <p>   path to graph.json (default: <repo>/graphify-out/graph.json)
+  --db <path>          (--from codegraph) path to codegraph.db
+                       (default: <repo>/.codegraph/codegraph.db)
   --no-commit          write the file but do not git-commit in the vault
+
+  --from codegraph reads the SQLite index produced by \`codegraph init/index\`
+  (@colbymchenry/codegraph, tree-sitter, 24+ languages) — the rich path with
+  call/inheritance/decorator edges. Run codegraph in the project repo first.
 `;
 
 // ----------------------------- mapping helpers -----------------------------
@@ -279,6 +287,121 @@ function resolveLocalImport(fromAbs, spec, repo, moduleIds) {
   return null;
 }
 
+// ----------------------------- source: codegraph -----------------------------
+//
+// @colbymchenry/codegraph (MIT, tree-sitter) indexes a repo into SQLite at
+// .codegraph/codegraph.db. We read it with node's built-in node:sqlite (no extra
+// dep) and map to our lean JSONL: file→module, class/function/method kept, and
+// import/variable nodes dropped (they inflate the graph without aiding orientation,
+// same policy as the other sources). Edges keep the high-value relations codegraph
+// resolves — calls, instantiates, extends, decorates, references — plus defines
+// (from `contains`) and module→module imports (collapsed from resolved imports).
+
+// codegraph node.kind → our CodeKind; anything not here is dropped as a node.
+const CG_KEEP_KIND = { file: "module", class: "class", function: "function", method: "method" };
+// codegraph edge.kind → our relation verb (symbol-level unless noted).
+const CG_REL = {
+  contains: "defines",
+  calls: "calls",
+  instantiates: "instantiates",
+  extends: "extends",
+  decorates: "decorates",
+  references: "references",
+};
+// Keep the namespace lean: skip test files (matches graphify/ts-naive convention).
+const CG_EXCLUDE = /(^|\/)tests?\//;
+
+function cgConfidence(metaJson) {
+  try {
+    const c = JSON.parse(metaJson ?? "{}").confidence;
+    if (typeof c !== "number") return "extracted";
+    return c >= 0.85 ? "extracted" : c >= 0.5 ? "inferred" : "ambiguous";
+  } catch {
+    return "extracted";
+  }
+}
+
+function fromCodegraph(repo, dbPathOpt) {
+  const dbPath = dbPathOpt ?? path.join(repo, ".codegraph", "codegraph.db");
+  if (!existsSync(dbPath)) {
+    die(
+      `codegraph db not found at ${dbPath}. Run \`codegraph init\` (then \`codegraph sync\`) ` +
+        `in the project first, or pass --db. (npm i -g @colbymchenry/codegraph)`,
+    );
+  }
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const rawNodes = db.prepare("SELECT id, kind, name, qualified_name, file_path, start_line FROM nodes").all();
+    const rawEdges = db.prepare("SELECT source, target, kind, metadata FROM edges").all();
+
+    const nodes = [];
+    const kept = new Map(); // cgId → our node id (only module/class/function/method)
+    const fileOf = new Map(); // cgId → file_path, for ALL nodes (to collapse imports)
+    const moduleIds = new Set(); // file paths that became module nodes
+    const usedIds = new Set();
+
+    for (const r of rawNodes) {
+      const file = toPosix(r.file_path);
+      fileOf.set(r.id, file);
+      if (CG_EXCLUDE.test(file)) continue;
+      const kind = CG_KEEP_KIND[r.kind];
+      if (!kind) continue; // drop import / variable nodes
+      let id;
+      if (kind === "module") {
+        id = file;
+        moduleIds.add(file);
+      } else {
+        id = `${file}#${r.name}`;
+        if (usedIds.has(id)) id = `${file}#${r.qualified_name}`; // disambiguate rare same-file collisions
+      }
+      usedIds.add(id);
+      kept.set(r.id, id);
+      nodes.push({
+        t: "node",
+        id,
+        kind,
+        file,
+        ...(Number.isFinite(r.start_line) && r.start_line > 0 ? { line: Number(r.start_line) } : {}),
+      });
+    }
+
+    const edges = [];
+    const seen = new Set();
+    const add = (src, tgt, rel, conf) => {
+      if (!src || !tgt || src === tgt) return;
+      const key = `${src} ${tgt} ${rel}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      edges.push({ t: "edge", src, tgt, rel, conf });
+    };
+
+    for (const e of rawEdges) {
+      const conf = cgConfidence(e.metadata);
+      if (e.kind === "imports") {
+        // Collapse to module→module: the source is a file; the target's file tells us
+        // which local module it pulls from. External imports live in the importing file
+        // itself, so they collapse to a self-loop and are dropped.
+        const srcModule = fileOf.get(e.source);
+        const tgtModule = fileOf.get(e.target);
+        if (srcModule && tgtModule && moduleIds.has(srcModule) && moduleIds.has(tgtModule)) {
+          add(srcModule, tgtModule, "imports", conf);
+        }
+        continue;
+      }
+      const rel = CG_REL[e.kind];
+      if (!rel) continue; // unknown edge kind — skip rather than guess
+      const src = kept.get(e.source);
+      const tgt = kept.get(e.target);
+      if (!src || !tgt) continue; // an endpoint was a dropped node (import/variable/test)
+      add(src, tgt, rel, conf);
+    }
+
+    return { nodes, edges, generator: "codegraph+codegraph-sync" };
+  } finally {
+    db.close();
+  }
+}
+
 // ----------------------------- git -----------------------------
 
 function gitShortCommit(repo) {
@@ -323,12 +446,14 @@ function main() {
   const commit = gitShortCommit(repo);
 
   let result;
-  if (args.from === "graphify") {
+  if (args.from === "codegraph") {
+    result = fromCodegraph(repo, args.db);
+  } else if (args.from === "graphify") {
     result = fromGraphify(args.graphifyOut ?? path.join(repo, "graphify-out", "graph.json"));
   } else if (args.from === "ts-naive") {
     result = fromTsNaive(repo);
   } else {
-    die(`unknown --from '${args.from}': use graphify or ts-naive`);
+    die(`unknown --from '${args.from}': use codegraph, graphify or ts-naive`);
   }
 
   if (result.nodes.length === 0) die("extraction produced 0 nodes — nothing to write");
