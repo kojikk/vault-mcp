@@ -30,11 +30,19 @@ export function nodeRef(graph: Graph, id: string): string {
       return sanitize(node.label);
     case "concept":
       return `${sanitize(node.label)} (концепт без страницы)`;
+    case "code": {
+      const where = node.file ? `${sanitize(node.file, 120)}${node.line ? `:${node.line}` : ""}` : sanitize(node.id, 160);
+      return `${sanitize(node.label)} (${node.codeKind ?? "code"}, ${where})`;
+    }
+    case "codelink":
+      // KB-side stub pointing into a code namespace — never expanded, only signposted.
+      return `${sanitize(node.label)} (код-узел ${sanitize(node.id, 160)})`;
   }
 }
 
 function edgeLine(graph: Graph, e: GraphEdge): string {
-  const conf = e.layer === "semantic" ? ` [${e.confidence}]` : "";
+  // Typed layers (semantic edges from the brain, code edges from the AST) carry confidence.
+  const conf = e.layer === "semantic" || e.layer === "code" ? ` [${e.confidence}]` : "";
   return `- ${nodeRef(graph, e.src)} —${sanitize(e.relation, 60)}→ ${nodeRef(graph, e.tgt)}${conf}`;
 }
 
@@ -81,7 +89,7 @@ export function renderNeighbors(graph: Graph, id: string, incident: { edge: Grap
   const head = `${nodeRef(graph, id)} — ${incident.length} связь(ей):`;
   const lines = incident.map(({ edge, other }) => {
     const dir = edge.src === id ? "→" : "←";
-    const conf = edge.layer === "semantic" ? ` [${edge.confidence}]` : "";
+    const conf = edge.layer === "semantic" || edge.layer === "code" ? ` [${edge.confidence}]` : "";
     return `- ${dir} ${sanitize(edge.relation, 60)} ${dir === "→" ? "к" : "от"} ${nodeRef(graph, other)}${conf} (${edge.layer})`;
   });
   return [head, ...lines].join("\n");

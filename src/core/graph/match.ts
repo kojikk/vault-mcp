@@ -26,8 +26,36 @@ export function tokenize(s: string): string[] {
     .filter((t) => t.length > 1);
 }
 
+/**
+ * Split a programming identifier into its words: camelCase, PascalCase, snake_case,
+ * kebab-case, and path separators all break. "scoreQuery" → ["score","query"],
+ * "build_derived" → ["build","derived"], "src/core/match.ts#scoreQuery" → [...].
+ * Lets a natural-language code question ("где скоринг запроса"/"score query") reach a
+ * symbol whose name is a single glued token. KB matching never calls this.
+ */
+export function splitIdentifier(s: string): string[] {
+  const out = new Set<string>();
+  for (const chunk of s.split(/[^\p{L}\p{N}]+/u)) {
+    if (!chunk) continue;
+    // Break camel/Pascal humps: "scoreQuery" → "score Query", "HTTPServer" → "HTTP Server".
+    const split = chunk
+      .replace(/([a-zа-я0-9])([A-ZА-Я])/gu, "$1 $2")
+      .replace(/([A-ZА-Я]+)([A-ZА-Я][a-zа-я])/gu, "$1 $2");
+    for (const w of split.split(/\s+/)) {
+      const t = normalizeLabel(w);
+      if (t.length > 1) out.add(t);
+    }
+  }
+  return [...out];
+}
+
 /** Tokens a node is findable by: label, aliases, and its path segments for note/org nodes. */
-function nodeTokens(node: GraphNode): string[] {
+function nodeTokens(node: GraphNode, code: boolean): string[] {
+  if (code) {
+    // Code nodes: match on the symbol name, its identifier sub-words, and the file path.
+    const parts = [node.label, node.id, ...(node.file ? [node.file] : []), ...(node.sig ? [node.sig] : [])];
+    return [...new Set(parts.flatMap((p) => [...tokenize(p), ...splitIdentifier(p)]))];
+  }
   const parts = [node.label, ...node.aliases];
   if (node.kind === "note" || node.kind === "org") parts.push(node.id.replace(/\.md$/i, ""));
   return [...new Set(parts.flatMap(tokenize))];
@@ -38,8 +66,11 @@ export interface MatchHit {
   score: number;
 }
 
-export function matchNodes(graph: Graph, query: string, limit = 5): MatchHit[] {
-  const queryTokens = [...new Set(tokenize(query))];
+export function matchNodes(graph: Graph, query: string, limit = 5, opts?: { code?: boolean }): MatchHit[] {
+  const code = opts?.code ?? false;
+  // In code namespaces the IDF corpus is the project's own identifiers (a separate Graph),
+  // so matching can never bleed between knowledge and code; we only widen tokenization.
+  const queryTokens = [...new Set(code ? [...tokenize(query), ...splitIdentifier(query)] : tokenize(query))];
   if (queryTokens.length === 0) return [];
   const queryNorm = normalizeLabel(query);
 
@@ -47,7 +78,7 @@ export function matchNodes(graph: Graph, query: string, limit = 5): MatchHit[] {
   const df = new Map<string, number>();
   const tokensByNode = new Map<string, string[]>();
   for (const node of graph.nodes.values()) {
-    const toks = nodeTokens(node);
+    const toks = nodeTokens(node, code);
     tokensByNode.set(node.id, toks);
     for (const t of toks) df.set(t, (df.get(t) ?? 0) + 1);
   }

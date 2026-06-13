@@ -42,7 +42,16 @@ export interface GraphLintSection {
   semanticSkipped: number;
   /** entity pages covered / total entity pages, in percent (100 when there are none). */
   entityCoveragePct: number;
+  /** Bridges (code: endpoints) whose target is missing from the current code snapshot. */
+  staleBridges: string[];
 }
+
+/**
+ * Resolve a knowledge→code bridge against the live code snapshots: "ok" if the symbol is
+ * present, "no-ns" if the project has no snapshot, "no-symbol" if it was renamed/removed.
+ * Supplied by the caller (it owns the graph index) so lint stays decoupled from assembly.
+ */
+export type BridgeResolver = (project: string, nodeId: string) => "ok" | "no-ns" | "no-symbol";
 
 function isUnder(rel: string, dir: string): boolean {
   return rel === dir || rel.startsWith(dir + "/");
@@ -77,10 +86,21 @@ function extractTargets(content: string): string[] {
  * graph_query can never disagree about what resolves. Path-like concept labels (containing
  * '/' or '.md') mean a semantic edge was recorded against a page that no longer exists.
  */
-export function graphLintSection(graph: Graph): GraphLintSection {
+export function graphLintSection(graph: Graph, resolveBridge?: BridgeResolver): GraphLintSection {
   const brokenEdgeEndpoints: string[] = [];
   const conceptCandidates: string[] = [];
+  const staleBridges: string[] = [];
   for (const node of graph.nodes.values()) {
+    // Bridges into code: verify the target still exists in the project's snapshot.
+    if (node.kind === "codelink") {
+      if (!resolveBridge) continue;
+      const m = /^code:([^/]+)\/(.+)$/.exec(node.id);
+      if (!m) continue;
+      const status = resolveBridge(m[1]!, m[2]!);
+      if (status === "no-ns") staleBridges.push(`${node.id} (нет снимка проекта)`);
+      else if (status === "no-symbol") staleBridges.push(`${node.id} (символ отсутствует в снимке — переименован?)`);
+      continue;
+    }
     if (node.kind !== "concept") continue;
     const degree = (graph.adjacency.get(node.id) ?? []).length;
     if (degree === 0) continue;
@@ -106,10 +126,11 @@ export function graphLintSection(graph: Graph): GraphLintSection {
     conceptCandidates: conceptCandidates.sort(),
     semanticSkipped: graph.semanticSkipped,
     entityCoveragePct: entities === 0 ? 100 : Math.round((covered.size / entities) * 100),
+    staleBridges: staleBridges.sort(),
   };
 }
 
-export function runLint(core: VaultCore, graph?: Graph): LintReport {
+export function runLint(core: VaultCore, graph?: Graph, resolveBridge?: BridgeResolver): LintReport {
   const files = allFiles(core);
   const mdFiles = files.filter((f) => f.toLowerCase().endsWith(".md"));
 
@@ -238,6 +259,6 @@ export function runLint(core: VaultCore, graph?: Graph): LintReport {
     staleEntities,
     unlinkedRaw,
     openContradictions,
-    ...(graph ? { graph: graphLintSection(graph) } : {}),
+    ...(graph ? { graph: graphLintSection(graph, resolveBridge) } : {}),
   };
 }

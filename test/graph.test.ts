@@ -1,18 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, realpathSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, realpathSync, mkdirSync, writeFileSync, readFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { VaultCore } from "../src/core/vault-core.js";
-import { GraphIndex } from "../src/core/graph/assemble.js";
+import { GraphIndex, buildCodeGraph, parseCodeRef } from "../src/core/graph/assemble.js";
 import { makeServerFactory } from "../src/mcp.js";
 import { parseRefs } from "../src/core/graph/linkparse.js";
 import { buildDerived } from "../src/core/graph/builder.js";
-import { matchNodes, normalizeLabel, tokenize } from "../src/core/graph/match.js";
+import { matchNodes, normalizeLabel, tokenize, splitIdentifier } from "../src/core/graph/match.js";
 import { bfsSubgraph, shortestPath } from "../src/core/graph/traverse.js";
 import { sanitize, renderSubgraph } from "../src/core/graph/render.js";
-import { loadSemantic, EDGES_FILE } from "../src/core/graph/store.js";
+import { loadSemantic, EDGES_FILE, loadCodeNamespace, listCodeNamespaces, codeNsRel } from "../src/core/graph/store.js";
 import { detectCommunities, godNodes } from "../src/core/graph/communities.js";
 import { runLint } from "../src/core/lint.js";
 
@@ -338,5 +338,171 @@ describe("lint graph section", () => {
     const lintOut = await text("lint");
     const parsed = JSON.parse(lintOut.slice(lintOut.indexOf("{")));
     expect(parsed.graph.brokenEdgeEndpoints).toContain("Знания/Удалённая.md");
+  });
+});
+
+// --------------------------- code namespaces (GRAPH-PLAN-CODE.md) ---------------------------
+
+/** A small fixture code snapshot: a module with two functions that call each other. */
+const FIXTURE_NS = [
+  '{"t":"meta","project":"fixture","commit":"abc1234","scanned":"2026-06-13","generator":"test"}',
+  '{"t":"node","id":"src/match.ts","kind":"module","file":"src/match.ts"}',
+  '{"t":"node","id":"src/match.ts#scoreQuery","kind":"function","file":"src/match.ts","line":42,"sig":"scoreQuery(q: string)"}',
+  '{"t":"node","id":"src/match.ts#tokenize","kind":"function","file":"src/match.ts","line":10}',
+  '{"t":"node","id":"src/build.ts","kind":"module","file":"src/build.ts"}',
+  '{"t":"edge","src":"src/match.ts","tgt":"src/match.ts#scoreQuery","rel":"defines","conf":"extracted"}',
+  '{"t":"edge","src":"src/match.ts","tgt":"src/match.ts#tokenize","rel":"defines","conf":"extracted"}',
+  '{"t":"edge","src":"src/match.ts#scoreQuery","tgt":"src/match.ts#tokenize","rel":"calls","conf":"extracted"}',
+  '{"t":"edge","src":"src/build.ts","tgt":"src/match.ts","rel":"imports","conf":"extracted"}',
+  "{broken json line",
+  "",
+].join("\n") + "\n";
+
+describe("code namespace store", () => {
+  it("loads nodes/edges/meta and skips malformed lines", () => {
+    file(codeNsRel("fixture"), FIXTURE_NS);
+    const load = loadCodeNamespace(vaultRoot, "fixture");
+    expect(load).not.toBeNull();
+    expect(load!.project).toBe("fixture");
+    expect(load!.commit).toBe("abc1234");
+    expect(load!.nodes).toBe(4);
+    expect(load!.edges).toBe(4);
+    expect(load!.skipped).toBe(1); // the one broken json line
+  });
+
+  it("returns null for a missing project and rejects invalid project names", () => {
+    expect(loadCodeNamespace(vaultRoot, "nope")).toBeNull();
+    expect(() => codeNsRel("../escape")).toThrow();
+    expect(() => codeNsRel("Bad Name")).toThrow();
+  });
+
+  it("listCodeNamespaces summarizes each snapshot without building a graph", () => {
+    file(codeNsRel("fixture"), FIXTURE_NS);
+    const list = listCodeNamespaces(vaultRoot);
+    expect(list.map((c) => c.project)).toContain("fixture");
+    const f = list.find((c) => c.project === "fixture")!;
+    expect(f.nodes).toBe(4);
+  });
+});
+
+describe("code namespace assembly + match", () => {
+  it("splitIdentifier breaks camelCase / snake_case / paths", () => {
+    expect(splitIdentifier("scoreQuery")).toEqual(["score", "query"]);
+    expect(splitIdentifier("build_derived")).toContain("derived");
+    expect(splitIdentifier("src/core/match.ts#scoreQuery")).toEqual(
+      expect.arrayContaining(["src", "core", "match", "score", "query"]),
+    );
+  });
+
+  it("buildCodeGraph assembles an isolated graph; code match finds a symbol by sub-word", () => {
+    const load = loadCodeNamespace(vaultRoot, "fixture") ?? (() => {
+      file(codeNsRel("fixture"), FIXTURE_NS);
+      return loadCodeNamespace(vaultRoot, "fixture")!;
+    })();
+    const g = buildCodeGraph(load);
+    expect(g.nodes.get("src/match.ts#scoreQuery")?.kind).toBe("code");
+    // "score query" must reach scoreQuery via identifier splitting (code mode only).
+    const hit = matchNodes(g, "score query", 3, { code: true })[0];
+    expect(hit?.node.id).toBe("src/match.ts#scoreQuery");
+  });
+
+  it("does NOT leak code identifiers into kb matching", () => {
+    file(codeNsRel("fixture"), FIXTURE_NS);
+    file("Знания/Заметка.md", "обычная заметка");
+    const kb = graph.get();
+    // scoreQuery is a code symbol — the kb graph must not know it at all.
+    expect(kb.nodes.has("src/match.ts#scoreQuery")).toBe(false);
+    expect(matchNodes(kb, "scoreQuery").length).toBe(0);
+  });
+});
+
+describe("ns routing in tools", () => {
+  beforeEach(() => file(codeNsRel("fixture"), FIXTURE_NS));
+
+  it("graph_query routes to a code namespace and points at the file", async () => {
+    const out = await text("graph_query", { question: "scoreQuery", ns: "code:fixture" });
+    expect(out).toContain("src/match.ts");
+    expect(out).toContain("function");
+  });
+
+  it("graph_query errors clearly on an unknown ns and a missing project", async () => {
+    expect(await text("graph_query", { question: "x", ns: "garbage" })).toContain("неизвестный ns");
+    expect(await text("graph_query", { question: "x", ns: "code:absent" })).toContain("нет код-графа");
+  });
+
+  it("graph_neighbors and graph_path work inside a code namespace", async () => {
+    const nb = await text("graph_neighbors", { node: "src/match.ts#scoreQuery", ns: "code:fixture" });
+    expect(nb).toContain("tokenize");
+    const pth = await text("graph_path", { source: "src/build.ts", target: "src/match.ts#tokenize", ns: "code:fixture" });
+    expect(pth).toContain("tokenize");
+  });
+
+  it("graph_stats lists code namespaces separately from kb totals", async () => {
+    const out = await text("graph_stats");
+    expect(out).toContain("code:fixture");
+    expect(out).toMatch(/4 узлов/);
+  });
+
+  it("getCode reloads when the snapshot file changes (mtime)", async () => {
+    const first = graph.getCode("fixture");
+    expect(first!.graph.nodes.has("src/build.ts")).toBe(true);
+    // Overwrite with a different snapshot and bump mtime into the future.
+    const abs = path.join(vaultRoot, codeNsRel("fixture"));
+    const smaller =
+      '{"t":"meta","project":"fixture","scanned":"2026-06-14"}\n{"t":"node","id":"src/only.ts","kind":"module","file":"src/only.ts"}\n';
+    writeFileSync(abs, smaller, "utf8");
+    const future = new Date(Date.now() + 5000);
+    utimesSync(abs, future, future);
+    const second = graph.getCode("fixture");
+    expect(second!.graph.nodes.has("src/only.ts")).toBe(true);
+    expect(second!.graph.nodes.has("src/build.ts")).toBe(false);
+  });
+});
+
+describe("knowledge↔code bridges", () => {
+  beforeEach(() => file(codeNsRel("fixture"), FIXTURE_NS));
+
+  it("graph_upsert records a bridge; kb graph_query shows a code stub, not code nodes", async () => {
+    file("Проекты/Сервис.md", "---\ntype: entity\n---\nоплата");
+    const up = await text("graph_upsert", {
+      edges: [{ src: "Проекты/Сервис.md", tgt: "code:fixture/src/match.ts#scoreQuery", relation: "реализовано в" }],
+    });
+    expect(up).toContain("appended 1");
+
+    const out = await text("graph_query", { question: "Сервис" });
+    expect(out).toContain("Мосты в код:");
+    expect(out).toContain("код-граф fixture");
+    // The actual code node must NOT be expanded into the kb result.
+    expect(out).not.toContain("src/match.ts#tokenize");
+  });
+
+  it("rejects code↔code bridges and malformed code refs", async () => {
+    const both = await text("graph_upsert", {
+      edges: [{ src: "code:fixture/src/a.ts#x", tgt: "code:fixture/src/b.ts#y", relation: "calls" }],
+    });
+    expect(both).toContain("code↔code запрещено");
+    const bad = await text("graph_upsert", {
+      edges: [{ src: "Проекты/Сервис.md", tgt: "code:BadProject/x", relation: "r" }],
+    });
+    expect(bad).toContain("Некорректный код-мост");
+  });
+
+  it("parseCodeRef extracts project and node id", () => {
+    expect(parseCodeRef("code:fixture/src/match.ts#scoreQuery")).toEqual({
+      project: "fixture",
+      nodeId: "src/match.ts#scoreQuery",
+      codeId: "code:fixture/src/match.ts#scoreQuery",
+    });
+    expect(parseCodeRef("Знания/RAG.md")).toBeNull();
+  });
+
+  it("lint flags a bridge whose target is missing from the snapshot", async () => {
+    file("Проекты/Сервис.md", "---\ntype: entity\n---\nx");
+    await text("graph_upsert", {
+      edges: [{ src: "Проекты/Сервис.md", tgt: "code:fixture/src/match.ts#renamedAway", relation: "реализовано в" }],
+    });
+    const lintOut = await text("lint");
+    const parsed = JSON.parse(lintOut.slice(lintOut.indexOf("{")));
+    expect(parsed.graph.staleBridges.join(" ")).toContain("renamedAway");
   });
 });

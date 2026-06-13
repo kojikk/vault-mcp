@@ -14,9 +14,21 @@
  *  - tag     → "tag:<name>"
  *  - concept → "concept:<normalized label>" — a semantic-edge endpoint that resolves to
  *              no page yet; lint surfaces these as entity-page candidates.
+ *
+ * Code namespaces (GRAPH-PLAN-CODE.md) live in their OWN assembled graphs, never mixed
+ * into the knowledge graph above. Two extra kinds carry them:
+ *  - code     → a symbol inside a code namespace (module/class/function/method/note),
+ *               id "<file>#<symbol>" or "<file>" for a module. Only ever appears in a
+ *               graph built from _system/graph/code/<project>.jsonl.
+ *  - codelink → a KB-side stub pointing INTO a code namespace, id "code:<project>/<id>".
+ *               It is the far end of a bridge edge the brain records with graph_upsert;
+ *               it is never expanded in KB results (there is nothing behind it in the KB
+ *               graph) — graph_query only annotates it with the namespace's freshness.
  */
 
-export type NodeKind = "note" | "org" | "tag" | "concept";
+export type NodeKind = "note" | "org" | "tag" | "concept" | "code" | "codelink";
+/** Symbol classes inside a code namespace (mirrors graphify's node kinds). */
+export type CodeKind = "module" | "class" | "function" | "method" | "note";
 
 export interface GraphNode {
   id: string;
@@ -27,9 +39,17 @@ export interface GraphNode {
   entity: boolean;
   /** Frontmatter aliases — extra match targets for graph_query. */
   aliases: string[];
+  /** code nodes only: symbol class. */
+  codeKind?: CodeKind;
+  /** code nodes only: source file (namespace-relative) and 1-based line. */
+  file?: string;
+  line?: number;
+  /** code nodes only: signature snippet for display. */
+  sig?: string;
 }
 
-export type EdgeLayer = "derived" | "semantic";
+/** "code" — an edge inside a code namespace (extracted from source, never agent-written). */
+export type EdgeLayer = "derived" | "semantic" | "code";
 export type Confidence = "extracted" | "inferred" | "ambiguous";
 
 export interface GraphEdge {

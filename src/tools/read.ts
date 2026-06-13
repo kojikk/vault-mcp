@@ -272,13 +272,20 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
     {
       title: "Audit vault health",
       description:
-        "Read-only health report (agent.md §13): orphan pages, broken [[links]], stale entity pages, unprocessed _raw/ sources, open contradictions, and graph health (semantic edges to missing pages, uncovered entities, concept candidates). Nothing is changed — the brain decides what to fix. Returns structural metadata (paths/counts).",
+        "Read-only health report (agent.md §13): orphan pages, broken [[links]], stale entity pages, unprocessed _raw/ sources, open contradictions, and graph health (semantic edges to missing pages, uncovered entities, concept candidates, stale knowledge→code bridges). Nothing is changed — the brain decides what to fix. Returns structural metadata (paths/counts).",
       inputSchema: {},
       annotations: readOnly,
     },
     async () => {
       try {
-        const report = runLint(core, ctx.graph.get());
+        // Resolve knowledge→code bridges against the live code snapshots so lint can flag
+        // bridges left dangling by a refactor (GRAPH-PLAN-CODE.md §5).
+        const resolveBridge = (project: string, nodeId: string): "ok" | "no-ns" | "no-symbol" => {
+          const loaded = ctx.graph.getCode(project);
+          if (!loaded) return "no-ns";
+          return loaded.graph.nodes.has(nodeId) ? "ok" : "no-symbol";
+        };
+        const report = runLint(core, ctx.graph.get(), resolveBridge);
         const g = report.graph;
         const summary =
           `orphans: ${report.orphans.length}, brokenLinks: ${report.brokenLinks.length}, ` +
@@ -286,7 +293,7 @@ export function registerReadTools(server: McpServer, ctx: ToolContext): void {
           `openContradictions: ${report.openContradictions}` +
           (g
             ? `, graphBrokenEndpoints: ${g.brokenEdgeEndpoints.length}, graphUncoveredEntities: ${g.uncoveredEntities.length}, ` +
-              `conceptCandidates: ${g.conceptCandidates.length}, entityCoverage: ${g.entityCoveragePct}%`
+              `conceptCandidates: ${g.conceptCandidates.length}, entityCoverage: ${g.entityCoveragePct}%, staleBridges: ${g.staleBridges.length}`
             : "");
         return textResult(`${summary}\n${JSON.stringify(report, null, 2)}`);
       } catch (err) {
